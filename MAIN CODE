@@ -16,7 +16,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeybo
 from aiogram.exceptions import TelegramBadRequest
 
 # Токен
-BOT_TOKEN = "8605691922:AAEIshSCXXbPwH70J_tggFrFan3y0_ltVvo"
+BOT_TOKEN = "****************"
 SCHEDULE_DIR = Path(__file__).parent
 ANNOUNCEMENT_FILE = SCHEDULE_DIR / "announcement.txt"
 
