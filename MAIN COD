@@ -1,0 +1,403 @@
+#TELEGRAM-БОТ РАСПИСАНИЯ ЗАНЯТИЙ — С АВТОМАТИЧЕКСИМ ЗАДАНИЕМ АКТУАЛЬНОЙ НЕДЕЛИ + АДМИНКА
+import asyncio
+import logging
+import re
+from datetime import datetime, timedelta
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Optional
+from itertools import groupby
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.exceptions import TelegramBadRequest
+
+# Токен
+BOT_TOKEN = "8605691922:AAEIshSCXXbPwH70J_tggFrFan3y0_ltVvo"
+SCHEDULE_DIR = Path(__file__).parent
+ANNOUNCEMENT_FILE = SCHEDULE_DIR / "announcement.txt"
+
+# Пароль админинки
+ADMIN_PASSWORD = "3488"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Lesson:
+    day: str
+    time: str
+    week_type: str          # "odd", "even", "both"
+    entry_type: str
+    subject: str
+    room: str
+    teacher: str
+    groups: List[str] = field(default_factory=list)
+
+# Глобальные списки (заполняются один раз при старте)
+all_lessons: List[Lesson] = []
+all_groups: set = set()
+
+
+# ==========================================
+# 📄 ОПТИМИЗИРОВАННЫЙ ПАРСЕР
+# ==========================================
+DAYS_MAP = {
+    "понедельник": "Понедельник", "вторник": "Вторник", "среда": "Среда",
+    "четверг": "Четверг", "пятница": "Пятница", "суббота": "Суббота", "воскресенье": "Воскресенье"
+}
+
+RE_TIME = re.compile(r'^\d+\s*пара\s*\(')
+RE_ROOM = re.compile(r'ауд\.\s*([^\(—]+)', re.I)
+RE_TEACHER = re.compile(r'преп:\s*(.+?)(?:\s*гр:|$)', re.I)
+RE_GROUPS = re.compile(r'гр:\s*(.+)', re.I)
+
+def parse_lessons_file(text: str) -> List[Lesson]:
+    lessons = []
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    n = len(lines)
+    i = 0
+    current_day = current_time = None
+    current_week = "both"
+
+    while i < n:
+        line = lines[i]
+        low = line.lower()
+        if low in DAYS_MAP:
+            current_day = DAYS_MAP[low]
+            current_time = None
+            current_week = "both"
+            i += 1
+            continue
+        if RE_TIME.match(line):
+            current_time = line
+            current_week = "both"
+            i += 1
+            continue
+        if line == "▲": current_week, i = "odd", i + 1; continue
+        if line == "▼": current_week, i = "even", i + 1; continue
+
+        if current_day and current_time:
+            block = []
+            while i < n:
+                blk = lines[i]
+                if blk.lower() in DAYS_MAP or RE_TIME.match(blk) or blk in ["▲", "▼"]:
+                    break
+                block.append(blk)
+                i += 1
+                if "гр:" in blk.lower(): break
+
+            if len(block) >= 2:
+                entry_type, subject = block[0], block[1]
+                room = teacher = ""
+                groups = []
+                for b in block[2:]:
+                    b_low = b.lower()
+                    if "ауд." in b_low:
+                        m = RE_ROOM.search(b)
+                        room = m.group(1).strip() if m else b.replace("ауд.", "").split("—")[0].strip()
+                    if "преп:" in b_low:
+                        m = RE_TEACHER.search(b)
+                        if m: teacher = m.group(1).strip().rstrip(".,;")
+                    if "гр:" in b_low:
+                        m = RE_GROUPS.search(b)
+                        if m: groups = [g.strip() for g in re.split(r'[,;]', m.group(1)) if g.strip()]
+
+                if subject:
+                    lessons.append(Lesson(day=current_day, time=current_time, week_type=current_week,
+                                          entry_type=entry_type, subject=subject, room=room,
+                                          teacher=teacher, groups=groups))
+        else:
+            i += 1
+    return lessons
+
+def load_all_files():
+    global all_lessons, all_groups
+    all_lessons.clear()
+    all_groups.clear()
+
+    files = list(SCHEDULE_DIR.glob("*_les.txt"))
+    if not files:
+        logger.warning("Файлы *_les.txt не найдены!")
+        return
+
+    logger.info(f"📂 Загрузка {len(files)} файлов...")
+    for f in files:
+        try:
+            with open(f, "r", encoding="utf-8") as file: content = file.read()
+            parsed = parse_lessons_file(content)
+            all_lessons.extend(parsed)
+            for l in parsed: all_groups.update(l.groups)
+        except Exception as e: logger.error(f"Ошибка {f.name}: {e}")
+    logger.info(f"✅ Загружено {len(all_lessons)} пар. Уникальных групп: {len(all_groups)}")
+
+
+# РАБОТА С ОБЪЯВЛЕНИЯМИ
+def save_announcement(text: str):
+    """Сохраняет объявление в файл"""
+    try:
+        with open(ANNOUNCEMENT_FILE, "w", encoding="utf-8") as f:
+            f.write(text)
+        logger.info(f"✅ Объявление сохранено в {ANNOUNCEMENT_FILE.name}")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка сохранения объявления: {e}")
+        return False
+
+def load_announcement() -> Optional[str]:
+    """Загружает объявление из файла"""
+    try:
+        if ANNOUNCEMENT_FILE.exists():
+            with open(ANNOUNCEMENT_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            return content if content else None
+    except Exception as e:
+        logger.error(f"Ошибка чтения объявления: {e}")
+    return None
+
+# РАСЧЁТ ТЕКУЩЕЙ НЕДЕЛИ
+
+def get_current_parity() -> str:
+    """Возвращает 'odd' или 'even' относительно ориентира: 30.05.2026 = ▲ нечётная"""
+    today = datetime.now().date()
+    ref_monday = datetime(2026, 5, 25).date()  # Понедельник 39-й недели
+    curr_monday = today - timedelta(days=today.weekday())
+    diff_weeks = (curr_monday - ref_monday).days // 7
+    return "odd" if diff_weeks % 2 == 0 else "even"
+
+# ФОРМАТИРОВАНИЕ 
+def format_schedule(filtered: List[Lesson]) -> str:
+    if not filtered: return "📭 На выбранной неделе пар не найдено."
+
+    day_order = {"Понедельник":0, "Вторник":1, "Среда":2, "Четверг":3, "Пятница":4, "Суббота":5, "Воскресенье":6}
+    filtered.sort(key=lambda x: (day_order.get(x.day, 99), x.time))
+
+    text = "📅 *Расписание*\n\n"
+    for day, day_items in groupby(filtered, key=lambda x: x.day):
+        text += f"🗓 *{day}*\n"
+        for time_slot, slot_items in groupby(day_items, key=lambda x: x.time):
+            text += f"⏰ `{time_slot}`\n"
+            for l in list(slot_items):
+                emoji = "🎓" if "Лекция" in l.entry_type else "🔬" if "Лабораторное" in l.entry_type else "✏️"
+                text += f"{emoji} {l.subject}\n"
+                if l.room: text += f"   🏫 ауд. {l.room}\n"
+                if l.teacher: text += f"   👨‍🏫 {l.teacher}\n"
+            text += "\n"
+        text += "\n"
+    return text
+
+def make_main_kb() -> InlineKeyboardMarkup:
+    """Главное меню с кнопкой объявлений"""
+    announcement = load_announcement()
+    kb = [
+        [InlineKeyboardButton(text="📅 Неделя", callback_data="week_select")],
+        [InlineKeyboardButton(text="👥 Группа", callback_data="group_select")]
+    ]
+    if announcement:
+        kb.append([InlineKeyboardButton(text="📢 Объявления", callback_data="show_announcement")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def make_week_kb() -> InlineKeyboardMarkup:
+    current_p = get_current_parity()
+    actual_label = "📅 Актуальная ▲" if current_p == "odd" else "📅 Актуальная ▼"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▲ Нечётная", callback_data="week_odd"),
+         InlineKeyboardButton(text="▼ Чётная", callback_data="week_even")],
+        [InlineKeyboardButton(text=actual_label, callback_data="week_actual")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+    ])
+
+def make_nav_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сменить неделю", callback_data="change_week")],
+        [InlineKeyboardButton(text="👥 Другая группа", callback_data="change_group")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="back_main")]
+    ])
+
+def make_admin_kb() -> InlineKeyboardMarkup:
+    """Клавиатура администратора"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Общее объявление", callback_data="admin_announcement")],
+        [InlineKeyboardButton(text="🚪 Выйти из админки", callback_data="admin_exit")]
+    ])
+
+class ScheduleFSM(StatesGroup):
+    WAITING_GROUP = State()
+    WAITING_WEEK = State()
+
+class AdminFSM(StatesGroup):
+    WAITING_PASSWORD = State()
+    WRITING_ANNOUNCEMENT = State()
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+
+@dp.message(Command("start"))
+async def cmd_start(msg: types.Message, state: FSMContext):
+    await state.clear()
+    current = get_current_parity()
+    label = "▲ нечётная" if current == "odd" else "▼ чётная"
+    await msg.answer(
+        f"🎓 *Бот расписания занятий*\n\n"
+        f"📆 Сейчас: *{label} неделя*\n"
+        f"Выберите действие:",
+        reply_markup=make_main_kb(), parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(F.data == "back_main")
+async def back_to_main(cb: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("🎓 *Главное меню*:", reply_markup=make_main_kb())
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "week_select")
+async def select_week_mode(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ScheduleFSM.WAITING_WEEK)
+    await cb.message.edit_text("📅 *Выберите неделю:*", reply_markup=make_week_kb(), parse_mode="Markdown")
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("week_"), ScheduleFSM.WAITING_WEEK)
+async def select_week(cb: types.CallbackQuery, state: FSMContext):
+    data_type = cb.data.split("_")[1]
+
+    if data_type == "odd":
+        parity, label = "odd", "нечётная"
+    elif data_type == "even":
+        parity, label = "even", "чётная"
+    elif data_type == "actual":
+        parity = get_current_parity()
+        label = f"актуальная ({'нечётная' if parity == 'odd' else 'чётная'})"
+    else:
+        return await cb.answer("Ошибка данных", show_alert=True)
+
+    await state.update_data(week_type=parity)
+    await state.set_state(ScheduleFSM.WAITING_GROUP)
+
+    try:
+        await cb.message.edit_text(f"✅ Выбрана {label} неделя.\nОтправьте номер группы:", parse_mode="Markdown")
+    except TelegramBadRequest:
+        await cb.answer(f"Выбрана {label} неделя. Отправьте номер группы.", show_alert=True)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "group_select")
+async def select_group_mode(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ScheduleFSM.WAITING_GROUP)
+    await cb.message.edit_text("*Отправьте номер группы* (например: `4517`, `м531`):", parse_mode="Markdown")
+    await cb.answer()
+
+
+@dp.message(ScheduleFSM.WAITING_GROUP)
+async def get_group(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    week = data.get("week_type")
+    group = msg.text.strip()
+    if not group: return
+
+    filtered = [l for l in all_lessons
+                if group in l.groups and (l.week_type == "both" or l.week_type == week)]
+
+    if not filtered:
+        await msg.answer(f"Для группы `{group}` на этой неделе пар не найдено.", reply_markup=make_nav_kb())
+        return
+
+    text = format_schedule(filtered)
+    await msg.answer(text, reply_markup=make_nav_kb(), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data == "change_week")
+async def change_week(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ScheduleFSM.WAITING_WEEK)
+    await cb.message.edit_text("📅 *Выберите неделю:*", reply_markup=make_week_kb(), parse_mode="Markdown")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "change_group")
+async def change_group(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ScheduleFSM.WAITING_GROUP)
+    await cb.message.edit_text("*Отправьте номер группы*:", parse_mode="Markdown")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "show_announcement")
+async def show_announcement(cb: types.CallbackQuery):
+    text = load_announcement()
+    if text:
+        await cb.answer(f"📢 {text[:50]}...", show_alert=True)
+        await cb.message.answer(f"📢 *Объявление:*\n\n{text}", parse_mode="Markdown")
+    else:
+        await cb.answer("⚠Объявлений пока нет", show_alert=True)
+    await cb.answer()
+
+
+# АДМИНКА — СКРЫТАЯ ЧАСТЬ
+@dp.message(Command("admin"))
+async def admin_start(msg: types.Message, state: FSMContext):
+    await state.set_state(AdminFSM.WAITING_PASSWORD)
+    await msg.answer("🔐 *Введите пароль администратора:*\n(Для выхода отправьте /start)", parse_mode="Markdown")
+
+
+@dp.message(AdminFSM.WAITING_PASSWORD)
+async def admin_check_password(msg: types.Message, state: FSMContext):
+    if msg.text.strip() == ADMIN_PASSWORD:
+        await state.set_state(None)  # Сбрасываем состояние, но помечаем админа
+        await msg.answer(
+            "✅ *Доступ разрешён!*\n\n"
+            "🛠️ *Панель администратора*\nВыберите действие:",
+            reply_markup=make_admin_kb(), parse_mode="Markdown"
+        )
+    else:
+        await msg.answer("Неверный пароль. Доступ запрещён.", reply_markup=ReplyKeyboardRemove())
+        await state.clear()
+
+
+@dp.callback_query(F.data == "admin_announcement")
+async def admin_start_announcement(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFSM.WRITING_ANNOUNCEMENT)
+    await cb.message.edit_text(
+        "✍️ *Напишите текст объявления:*\n"
+        "Отправьте сообщение с текстом, и оно появится у всех студентов.\n"
+        "Для отмены отправьте /start",
+        parse_mode="Markdown"
+    )
+    await cb.answer()
+
+
+@dp.message(AdminFSM.WRITING_ANNOUNCEMENT)
+async def admin_save_announcement(msg: types.Message, state: FSMContext):
+    text = msg.text.strip()
+    if not text or text.startswith("/"):
+        await state.clear()
+        return
+
+    if save_announcement(text):
+        await msg.answer("✅ *Объявление сохранено!*\nТеперь оно видно всем студентам в меню.", parse_mode="Markdown")
+    else:
+        await msg.answer("Ошибка сохранения. Проверьте права на запись файла.")
+
+    await state.clear()
+
+@dp.callback_query(F.data == "admin_exit")
+async def admin_exit(cb: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("Вы вышли из режима администратора.", reply_markup=make_main_kb())
+    await cb.answer()
+
+async def main():
+    load_all_files()
+    logger.info("Запуск бота...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Остановлен пользователем")
